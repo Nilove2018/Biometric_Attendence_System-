@@ -1,0 +1,626 @@
+//115200 baud
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <ESP8266HTTPClient.h>
+#include <Adafruit_Fingerprint.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+#include <SoftwareSerial.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define TOUCH_PIN 13  // D7 (GPIO13) for touch sensing
+#define BUZZER_PIN 2
+#define BUTTON_PIN 0
+#define RX_PIN 12  // Fingerprint RX
+#define TX_PIN 14  // Fingerprint TX
+
+
+unsigned long buttonPressTime = 0;
+const unsigned long holdTime = 1000;  // 1 second for long press
+bool buttonHeld = false;
+bool menuOpen = false;
+int lastSwitchState = HIGH;
+unsigned long lastActivityTime = 0;
+const unsigned long timeoutDuration = 10000;  // 10 seconds timeout for enroll/check modes
+int menuSelection = 0;                        // Cursor position
+
+
+SoftwareSerial mySerial(RX_PIN, TX_PIN);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+const char* ssid = "NOVO";
+const char* password = "18000327";
+const char* attendanceAPI = "https://script.google.com/macros/s/AKfycbwbvmEUMTsaR-GFAXZOMnUiN2elCT_OwuNl2Xoye-vHm83FvJFC-bSTAEqvEUBs0ioH/exec";
+const char* studentDatabaseAPI = "https://script.google.com/macros/s/AKfycby50ubvU5L-1a5Mut92FsqU-7vLOjkKDB4L1bT3NtH_DCDLo4v_jRQD0_x2xx2YgS8H/exec";
+
+int mode = 0;  // 0 = Attendance, 1 = Enroll, 2 = Check Student
+int lastButtonState = HIGH;
+
+struct Student {
+  int id;
+  String name;
+};
+
+Student students[100];  // Array to store 100 students
+int studentCount = 0;
+void fetchStudentData() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  Serial.println("Fetching student data...");
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(20, 22);
+  display.println("Connecting to");
+  display.setTextSize(2);
+  display.setCursor(0, 35);
+  display.println("-Database-");
+  display.display();
+
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // Allow redirects
+  http.begin(client, studentDatabaseAPI);
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode == 200) {
+    String payload = http.getString();
+    Serial.println("Data received: " + payload);
+
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error) {
+      Serial.print("JSON Parsing Failed: ");
+      Serial.println(error.c_str());
+      return;
+    }
+
+    studentCount = doc["count"];
+    Serial.print("Total Students: ");
+    Serial.println(studentCount);
+
+    for (int i = 0; i < studentCount; i++) {
+      students[i].id = doc["students"][i]["id"].as<int>();  // Convert ID to int
+      students[i].name = doc["students"][i]["name"].as<String>();
+
+      Serial.print("Stored: ID=");
+      Serial.print(students[i].id);
+      Serial.print(", Name=");
+      Serial.println(students[i].name);
+    }
+  } else {
+    Serial.print("❌ Error fetching student data. HTTP Code: ");
+    Serial.println(httpResponseCode);
+
+    display.clearDisplay();
+    display.setTextColor(WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 10);
+    display.println("Fail to reach");
+    display.setTextSize(2);
+    display.setCursor(18, 22);
+    display.println("Online!");
+    display.setTextSize(1);
+    display.setCursor(8, 42);
+    display.println("check your internet!");
+    display.display();
+    delay(2000);
+  }
+  http.end();
+}
+
+void sendDataToGoogleSheet(String name, int id) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  name.replace(" ", "%20");  // Replace spaces for URL encoding
+  String url = String(attendanceAPI) + "?name=" + name + "&id=" + String(id);
+
+  Serial.println("Sending data to Google Sheet...");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // Allow redirects
+  http.begin(client, url);
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode == 200) {
+    Serial.println("✅ Attendance recorded successfully!");
+    display.clearDisplay();
+    display.setTextColor(WHITE);
+    display.setTextSize(2);
+    display.setCursor(15, 22);
+    display.println("Success!");
+    display.display();
+  } else {
+    Serial.println("❌ Error sending data. HTTP Code: " + String(httpResponseCode));
+  }
+
+  http.end();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TOUCH_PIN, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed!");
+    while (1)
+      ;
+  }
+  display.clearDisplay();
+  display.display();
+
+  WiFi.begin(ssid, password);
+  display.clearDisplay();  // Clear previous content
+  display.setTextColor(WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 10);
+  display.print("Connecting");
+  display.setTextSize(2);
+  display.setCursor(45, 20);
+  //   display.setCursor(int16_t x, int16_t y)
+  display.print("...");
+  display.setTextSize(1);
+  display.setCursor(0, 45);
+  display.println("WiFi: " + String(ssid));
+  display.display();  // ✅ REQUIRED to update screen
+  //displayMessage("Connecting...", "WiFi: " + String(ssid));
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi!");
+  display.clearDisplay();  // Clear previous content
+  display.setTextColor(WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 20);
+  display.print("WiFi");
+  display.setTextSize(1);
+  display.setCursor(50, 30);
+  display.print("Connected!");
+  display.setTextSize(1);
+  display.setCursor(0, 55);
+  display.print("IP: " + WiFi.localIP().toString());
+  display.display();
+  delay(500);
+
+  finger.begin(57600);
+  if (!finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor not found!");
+    displayMessage("ERROR!", "Fingerprint sensor not Found!");
+    delay(5000);
+    Serial.println("Press Button to Restart...");
+    displayMessage("Press Button!", "to Restart...");
+    while (digitalRead(BUTTON_PIN) == HIGH) {
+      delay(100);
+    }
+    ESP.restart();
+  }
+
+  fetchStudentData();
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(30, 10);
+  display.println("System Redy!");
+  display.setTextSize(1);
+  display.setCursor(0, 20);
+  display.println("Mode:");
+  display.setTextSize(2);
+  display.setCursor(5, 32);
+  display.println("Attendance");
+  display.setTextSize(1);
+  display.setCursor(8, 52);
+  display.println("place your finger..");
+  display.display();
+}
+
+void loop() {
+  int switchState = digitalRead(BUTTON_PIN);
+  unsigned long currentTime = millis();
+
+  // Button Press Detected
+  if (switchState == LOW && lastSwitchState == HIGH) {
+    buttonPressTime = currentTime;
+    buzzerNavigation();
+  }
+
+  // Button Hold Detection (Enter Mode)
+  if (switchState == LOW && (currentTime - buttonPressTime > holdTime) && !buttonHeld) {
+    buttonHeld = true;
+    buzzerConfirm();
+    selectMode();
+  }
+
+  // Button Released (Short Click - Move Cursor)
+  if (switchState == HIGH && lastSwitchState == LOW) {
+    if (!buttonHeld) {
+      if (!menuOpen) {
+        menuOpen = true;
+        menuSelection = 0;  // Reset cursor to first option
+      } else {
+        menuSelection = (menuSelection + 1) % 3;  // Move cursor down
+      }
+      displayMenu();
+    }
+    buttonHeld = false;
+    lastActivityTime = millis();
+  }
+
+  lastSwitchState = switchState;
+
+  // Timeout logic for Enroll Mode (1) and Check Mode (2)
+  if ((mode == 1 || mode == 2) && (millis() - lastActivityTime > timeoutDuration)) {
+    resetToAttendance();
+  }
+
+  // Run selected mode if menu is not open
+  if (!menuOpen) {
+    if (mode == 0) checkAttendance();
+    else if (mode == 1) enrollStudent();
+    else if (mode == 2) checkStudentName();
+  }
+}
+
+// Function to show the menu as a list with a cursor
+void displayMenu() {
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  display.setTextSize(2);
+  display.setCursor(10, 5);
+  display.print("Mode ");
+
+  display.setTextSize(1);
+  display.setCursor(62, 12);
+  display.print("Select:");
+
+
+  display.setTextSize(1);
+  display.setCursor(30, 28);
+  display.println(menuSelection == 0 ? "-> Attendance <-" : "  Attendance");
+  display.setCursor(30, 40);
+  display.println(menuSelection == 1 ? "-> Enroll     <-" : "  Enroll");
+  display.setCursor(30, 52);
+  display.println(menuSelection == 2 ? "-> ID Check   <-" : "  ID Check");
+
+  display.display();
+}
+
+
+
+void checkAttendance() {
+  int id = getFingerprintID();
+
+  if (id > 0) {
+    String name = getStudentName(id);
+    if (name != "Unknown") {
+      display.clearDisplay();
+      display.setTextColor(WHITE);
+      display.setTextSize(1);
+      display.setCursor(10, 15);
+      display.print(name);
+      display.setTextSize(1);
+      display.setCursor(0, 30);
+      display.println("-------Present-------");
+      display.setTextSize(2);
+      display.setCursor(10, 50);
+      display.println("ID: " + String(id));
+      display.display();
+
+      //      displayMessage("Present: " + name, "ID: " + String(id));
+      sendDataToGoogleSheet(name, id);
+      buzzerSuccess1();
+      delay(500);
+    } else {
+      displayMessage("Unregistered ID", "Try Again!");
+      buzzerError();
+      delay(2000);
+    }
+  } else {
+    detectUnknownFinger();  // Call unknown finger detection
+  }
+}
+
+// Function to detect an unknown fingerprint when touch is sensed
+void detectUnknownFinger() {
+  if (digitalRead(TOUCH_PIN) == LOW) {  // Only detect when touched
+    Serial.println("⚠️ Unknown Finger Detected!");
+    displayMessage("Unknown Finger!", "Access Denied!");
+    buzzerError();
+    delay(2000);
+  }
+}
+
+
+void enrollStudent() {
+
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 10);
+  display.println("Mode:");
+  display.setTextSize(2);
+  display.setCursor(30, 22);
+  display.println("Enroll");
+  display.setTextSize(1);
+  display.setCursor(8, 42);
+  display.println("place your finger..");
+  display.display();
+
+  unsigned long startTime = millis();  // Record start time
+
+  while (millis() - startTime < 10000) {   // Keep checking for 10s
+    if (digitalRead(BUTTON_PIN) == LOW) {  // ✅ Mode button check
+      Serial.println("🔄 Mode Change Detected!");
+      return;  // Exit enrollment mode immediately
+    }
+
+    if (digitalRead(TOUCH_PIN) == LOW) {  // ✅ Finger detected
+      break;                              // Proceed with enrollment
+    }
+
+    delay(100);  // Prevent CPU overload
+  }
+
+  // If we reach here, either a finger was placed or time expired
+  if (millis() - startTime >= 10000) {
+    Serial.println("⚠ Timeout! No finger detected.");
+    displayMessage("Timeout!", "Try Again.");
+    delay(2000);
+    return;
+  }
+
+
+  int id = studentCount + 1;
+  if (fingerEnroll(id)) {
+    displayMessage("Enrolled!", "ID: " + String(id));
+    buzzerConfirm();
+    studentCount++;
+    fetchStudentData();
+  } else {
+    displayMessage("Enroll Failed!", "Try Again!");
+    buzzerError();
+  }
+  delay(2000);
+}
+
+void checkStudentName() {
+  // displayMessage("Check Mode", "Place Finger...");
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 10);
+  display.println("Mode:");
+  display.setTextSize(2);
+  display.setCursor(15, 22);
+  display.println("ID Chekh");
+  display.setTextSize(1);
+  display.setCursor(8, 42);
+  display.println("place your finger..");
+  display.display();
+
+  // ✅ Wait for a finger to be placed
+  while (digitalRead(TOUCH_PIN) == HIGH) {
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      Serial.println("🔄 Mode Change Detected!");
+      return;  // Allow mode change anytime
+    }
+    delay(50);
+  }
+
+  // ✅ Now scan the fingerprint
+  int id = getFingerprintID();
+  if (id > 0) {
+    String name = getStudentName(id);
+    displayMessage("ID: " + String(id), "Name: " + name);
+    buzzerConfirm();
+  } else {
+    displayMessage("Not Found!", "Try Again!");
+    buzzerError();
+  }
+
+  delay(500);
+}
+
+
+int getFingerprintID() {
+  if (digitalRead(TOUCH_PIN) == LOW) {
+    Serial.println("Finger detected, scanning...");
+
+    if (finger.getImage() == FINGERPRINT_OK) {
+      if (finger.image2Tz() == FINGERPRINT_OK) {
+        if (finger.fingerFastSearch() == FINGERPRINT_OK) {
+          int id = finger.fingerID;
+          Serial.print("✅ Fingerprint ID found: ");
+          Serial.println(id);
+
+          return id;
+        }
+      }
+    }
+  }
+  //Serial.println("❌ Finger not found");
+  return -1;
+}
+
+
+bool fingerEnroll(int id) {
+  displayMessage("Enroll Mode", "Place Finger...");
+  if (finger.getImage() != FINGERPRINT_OK) return false;
+  if (finger.image2Tz(1) != FINGERPRINT_OK) return false;
+  delay(500);
+  displayMessage("Enroll Mode", "Lift Finger...");
+  delay(1000);
+  displayMessage("Enroll Mode", "Place Again...");
+  if (finger.getImage() != FINGERPRINT_OK) return false;
+  if (finger.image2Tz(2) != FINGERPRINT_OK) return false;
+  if (finger.createModel() != FINGERPRINT_OK) return false;
+  if (finger.storeModel(id) != FINGERPRINT_OK) return false;
+  return true;
+}
+
+String getStudentName(int id) {
+  Serial.print("Searching for ID: ");
+  Serial.println(id);
+
+  for (int i = 0; i < studentCount; i++) {
+    Serial.print("Checking ID: ");
+    Serial.print(students[i].id);
+    Serial.print(" -> Name: ");
+    Serial.println(students[i].name);
+
+    if (students[i].id == id) {
+      Serial.print("✅ Match Found! Name: ");
+      Serial.println(students[i].name);
+      return students[i].name;
+    }
+  }
+
+  Serial.println("❌ No Match Found!");
+  return "Unknown";
+}
+
+
+
+
+void updateModeDisplay() {
+  String modeText = (mode == 0) ? "Attendance" : (mode == 1) ? "Enroll"
+                                                             : "Check";
+  displayMessage("Mode Changed", "Mode: " + modeText);
+}
+
+void displayMessage(String line1, String line2) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 20);
+  display.println(line1);
+  display.setCursor(0, 40);
+  display.println(line2);
+  display.display();
+}
+
+// Function to enter the selected mode
+void selectMode() {
+  menuOpen = false;
+  mode = menuSelection;
+  String modeText = (mode == 0) ? "Attendance" : (mode == 1) ? "Enroll"
+                                                             : "Check";
+  //displayMessage("Mode Selected", "Mode: " + modeText);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(2, 10);
+  display.println("____Current Mode____");
+  display.setTextSize(2);
+  display.setCursor(0, 30);
+  display.println(modeText);
+
+  if (mode == 0) {
+    display.setTextSize(1);
+    display.setCursor(8, 48);
+    display.println("place your finger..");
+  }
+  display.display();
+  lastActivityTime = millis();
+  delay(1000);
+}
+
+
+// Function to return to Attendance Mode after timeout
+void resetToAttendance() {
+  mode = 0;
+  menuOpen = false;
+  displayMessage("Timeout", "Returning to Attendance Mode");
+  buzzerNavigation();
+  delay(1000);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(2, 10);
+  display.println("____Current Mode____");
+  display.setTextSize(2);
+  display.setCursor(0, 30);
+  display.println("Attendance");
+  display.setTextSize(1);
+  display.setCursor(8, 48);
+  display.println("place your finger..");
+  display.display();
+}
+
+void buzzerSuccess() {
+  tone(BUZZER_PIN, 1000, 500);
+}
+void buzzerSuccess1() {
+  tone(BUZZER_PIN, 1000, 500);
+  delay(500);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(2, 10);
+  display.println("____Current Mode____");
+  display.setTextSize(2);
+  display.setCursor(0, 30);
+  display.println("Attendance");
+  display.setTextSize(1);
+  display.setCursor(8, 48);
+  display.println("place your finger..");
+  display.display();
+}
+void buzzerError() {
+  tone(BUZZER_PIN, 500, 500);
+}
+void buzzerNavigation() {
+  tone(BUZZER_PIN, 1200, 100);  // Short beep for mode change
+}
+void buzzerConfirm() {
+  tone(BUZZER_PIN, 800, 300);  // Confirmation beep (e.g., fingerprint scanned)
+}
+"
+
+Student Attendance Info
+"
+function doGet(e) {
+  return handleRequest(e);
+}
+
+function doPost(e) {
+  return handleRequest(e);
+}
+
+function handleRequest(e) {
+  var sheet = SpreadsheetApp.openById("1dVCbZ3sSyYwNtIiH2-9xdOzNnj2YrNxn-Wxzb3iay54").getActiveSheet();
+  
+  try {
+    var name = e.parameter.name;
+    var id = e.parameter.id;
+    
+    if (name && id) {
+      // Format date as per IST (DD/MM/YY HH:MM)
+      var date = new Date();
+      date = Utilities.formatDate(date, "Asia/Kolkata", "dd/MM/yy HH:mm");
+      
+      sheet.appendRow([date, name, id]);
+      return ContentService.createTextOutput("Success").setMimeType(ContentService.MimeType.TEXT);
+    } else {
+      return ContentService.createTextOutput("Error: Missing Data").setMimeType(ContentService.MimeType.TEXT);
+    }
+  } catch (error) {
+    return ContentService.createTextOutput("Error: " + error.message).setMimeType(ContentService.MimeType.TEXT);
+  }
+}
